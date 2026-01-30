@@ -1,26 +1,222 @@
-import express from 'express';
-import cors from 'cors';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import client, { testConnection } from './config/elasticsearch.js';
-import { detectPII } from './utils/pii-detector.js';
+import express from "express";
+import cors from "cors";
+import path from "path";
+import { fileURLToPath } from "url";
+import client, { testConnection } from "./config/elasticsearch.js";
+import { detectPII } from "./utils/pii-detector.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-// ... (rest of imports/middleware)
 
-// ... (previous routes)
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "frontend")));
 
-// Analyze a new document
-app.post('/api/analyze', async (req, res) => {
+// API Routes
+
+// Health check
+app.get("/api/health", async (req, res) => {
+  const connected = await testConnection();
+  res.json({
+    status: connected ? "healthy" : "unhealthy",
+    elasticsearch: connected,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Get dashboard stats
+app.get("/api/stats", async (req, res) => {
   try {
-    const { content, source = 'manual', author = 'user' } = req.body;
+    const [documents, violations, policies] = await Promise.all([
+      client.count({ index: "monitored-documents" }),
+      client.count({ index: "flagged-violations" }),
+      client.count({ index: "compliance-policies" }),
+    ]);
+
+    // Get flagged documents count
+    const flagged = await client.count({
+      index: "monitored-documents",
+      body: { query: { term: { flagged: true } } },
+    });
+
+    // Get high risk violations
+    const highRisk = await client.count({
+      index: "monitored-documents",
+      body: { query: { range: { risk_score: { gte: 0.7 } } } },
+    });
+
+    res.json({
+      totalDocuments: documents.count,
+      totalViolations: violations.count,
+      totalPolicies: policies.count,
+      flaggedDocuments: flagged.count,
+      highRiskDocuments: highRisk.count,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get recent flagged documents
+app.get("/api/documents/flagged", async (req, res) => {
+  try {
+    const result = await client.search({
+      index: "monitored-documents",
+      body: {
+        query: { term: { flagged: true } },
+        sort: [{ risk_score: "desc" }, { timestamp: "desc" }],
+        size: 50,
+      },
+    });
+
+    const documents = result.hits.hits.map((hit) => ({
+      id: hit._id,
+      ...hit._source,
+    }));
+
+    res.json({ documents, total: result.hits.total.value });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all documents with optional filtering
+app.get("/api/documents", async (req, res) => {
+  try {
+    const { source, minRisk, flaggedOnly } = req.query;
+
+    const must = [];
+    if (source) must.push({ term: { source } });
+    if (minRisk)
+      must.push({ range: { risk_score: { gte: parseFloat(minRisk) } } });
+    if (flaggedOnly === "true") must.push({ term: { flagged: true } });
+
+    const result = await client.search({
+      index: "monitored-documents",
+      body: {
+        query: must.length > 0 ? { bool: { must } } : { match_all: {} },
+        sort: [{ risk_score: "desc" }, { timestamp: "desc" }],
+        size: 100,
+      },
+    });
+
+    const documents = result.hits.hits.map((hit) => ({
+      id: hit._id,
+      ...hit._source,
+    }));
+
+    res.json({ documents, total: result.hits.total.value });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get violations
+app.get("/api/violations", async (req, res) => {
+  try {
+    const result = await client.search({
+      index: "flagged-violations",
+      body: {
+        query: { match_all: {} },
+        sort: [{ flagged_at: "desc" }],
+        size: 100,
+      },
+    });
+
+    const violations = result.hits.hits.map((hit) => ({
+      id: hit._id,
+      ...hit._source,
+    }));
+
+    res.json({ violations, total: result.hits.total.value });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Search policies using hybrid search
+app.post("/api/policies/search", async (req, res) => {
+  try {
+    const { query, framework } = req.body;
+
+    const must = [
+      {
+        multi_match: {
+          query,
+          fields: ["title^2", "content", "keywords"],
+          type: "best_fields",
+          fuzziness: "AUTO",
+        },
+      },
+    ];
+
+    if (framework) {
+      must.push({ term: { framework } });
+    }
+
+    const result = await client.search({
+      index: "compliance-policies",
+      body: {
+        query: { bool: { must } },
+        highlight: {
+          fields: {
+            content: { fragment_size: 200, number_of_fragments: 3 },
+          },
+        },
+        size: 10,
+      },
+    });
+
+    const policies = result.hits.hits.map((hit) => ({
+      id: hit._id,
+      ...hit._source,
+      highlights: hit.highlight?.content || [],
+      score: hit._score,
+    }));
+
+    res.json({ policies, total: result.hits.total.value });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all policies
+app.get("/api/policies", async (req, res) => {
+  try {
+    const { framework } = req.query;
+
+    const query = framework ? { term: { framework } } : { match_all: {} };
+
+    const result = await client.search({
+      index: "compliance-policies",
+      body: {
+        query,
+        sort: [{ framework: "asc" }, { article: "asc" }],
+        size: 100,
+      },
+    });
+
+    const policies = result.hits.hits.map((hit) => ({
+      id: hit._id,
+      ...hit._source,
+    }));
+
+    res.json({ policies, total: result.hits.total.value });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/analyze", async (req, res) => {
+  try {
+    const { content, source = "manual", author = "user" } = req.body;
 
     if (!content) {
-      return res.status(400).json({ error: 'Content is required' });
+      return res.status(400).json({ error: "Content is required" });
     }
 
     // Detect PII in application layer
@@ -28,53 +224,61 @@ app.post('/api/analyze', async (req, res) => {
 
     // Index the document with pre-calculated PII data
     const indexResponse = await client.index({
-      index: 'monitored-documents',
-      pipeline: 'pii-detection-pipeline', // Only sets timestamp etc.
+      index: "monitored-documents",
+      pipeline: "pii-detection-pipeline", // Only sets timestamp etc.
       document: {
         content,
         source,
         author,
-        channel: 'manual-upload',
+        channel: "manual-upload",
         author_email: `${author}@manual.input`,
         timestamp: new Date().toISOString(),
-        ...analysisResult // Spread PII detection results
+        ...analysisResult, // Spread PII detection results
       },
-      refresh: true
+      refresh: true,
     });
 
     // Fetch the analyzed document to assume persistence
     const analyzed = await client.get({
-      index: 'monitored-documents',
-      id: indexResponse._id
+      index: "monitored-documents",
+      id: indexResponse._id,
     });
 
     const doc = analyzed._source;
-    
+
     // Matched policies logic (same as before)
     let matchedPolicies = [];
     if (doc.pii_count > 0) {
       const policySearch = await client.search({
-        index: 'compliance-policies',
+        index: "compliance-policies",
         body: {
           query: {
             bool: {
               should: [
-                { match: { content: 'personal data disclosure' } },
-                { match: { content: 'pii protection' } },
-                { terms: { category: ['DATA_PROTECTION', 'PHI_DISCLOSURE', 'DATA_SECURITY'] } }
-              ]
-            }
+                { match: { content: "personal data disclosure" } },
+                { match: { content: "pii protection" } },
+                {
+                  terms: {
+                    category: [
+                      "DATA_PROTECTION",
+                      "PHI_DISCLOSURE",
+                      "DATA_SECURITY",
+                    ],
+                  },
+                },
+              ],
+            },
           },
-          size: 5
-        }
+          size: 5,
+        },
       });
 
-      matchedPolicies = policySearch.hits.hits.map(hit => ({
+      matchedPolicies = policySearch.hits.hits.map((hit) => ({
         id: hit._id,
         title: hit._source.title,
         framework: hit._source.framework,
         article: hit._source.article,
-        score: hit._score
+        score: hit._score,
       }));
     }
 
@@ -86,10 +290,15 @@ app.post('/api/analyze', async (req, res) => {
       piiCount: doc.pii_count,
       piiTypes: doc.pii_types,
       riskScore: doc.risk_score,
-      riskLevel: doc.risk_score >= 0.7 ? 'HIGH' : doc.risk_score >= 0.3 ? 'MEDIUM' : 'LOW',
+      riskLevel:
+        doc.risk_score >= 0.7
+          ? "HIGH"
+          : doc.risk_score >= 0.3
+            ? "MEDIUM"
+            : "LOW",
       flagged: doc.flagged,
       matchedPolicies,
-      recommendations: generateRecommendations(doc)
+      recommendations: generateRecommendations(doc),
     };
 
     res.json(analysis);
@@ -99,19 +308,19 @@ app.post('/api/analyze', async (req, res) => {
 });
 
 // Create a violation record
-app.post('/api/violations', async (req, res) => {
+app.post("/api/violations", async (req, res) => {
   try {
     const violation = {
       ...req.body,
-      status: 'PENDING',
+      status: "PENDING",
       flagged_at: new Date().toISOString(),
-      flagged_by: 'agent'
+      flagged_by: "agent",
     };
 
     const response = await client.index({
-      index: 'flagged-violations',
+      index: "flagged-violations",
       document: violation,
-      refresh: true
+      refresh: true,
     });
 
     res.json({ id: response._id, ...violation });
@@ -121,25 +330,25 @@ app.post('/api/violations', async (req, res) => {
 });
 
 // Update violation status
-app.patch('/api/violations/:id', async (req, res) => {
+app.patch("/api/violations/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const updates = req.body;
 
-    if (updates.status === 'REVIEWED' || updates.status === 'REMEDIATED') {
+    if (updates.status === "REVIEWED" || updates.status === "REMEDIATED") {
       updates.reviewed_at = new Date().toISOString();
     }
 
     await client.update({
-      index: 'flagged-violations',
+      index: "flagged-violations",
       id,
       body: { doc: updates },
-      refresh: true
+      refresh: true,
     });
 
     const updated = await client.get({
-      index: 'flagged-violations',
-      id
+      index: "flagged-violations",
+      id,
     });
 
     res.json({ id, ...updated._source });
@@ -151,66 +360,88 @@ app.patch('/api/violations/:id', async (req, res) => {
 // Generate remediation recommendations
 function generateRecommendations(doc) {
   const recommendations = [];
-  
+
   if (!doc.pii_types || doc.pii_types.length === 0) {
-    return ['No PII detected. Document appears safe.'];
+    return ["No PII detected. Document appears safe."];
   }
 
-  if (doc.pii_types.includes('SSN')) {
-    recommendations.push('🔴 CRITICAL: Social Security Number detected. Immediately delete this content and notify the Data Protection Officer.');
-    recommendations.push('Reference: GDPR Article 9 (Special Categories), HIPAA PHI Guidelines');
+  if (doc.pii_types.includes("SSN")) {
+    recommendations.push(
+      "🔴 CRITICAL: Social Security Number detected. Immediately delete this content and notify the Data Protection Officer.",
+    );
+    recommendations.push(
+      "Reference: GDPR Article 9 (Special Categories), HIPAA PHI Guidelines",
+    );
   }
 
-  if (doc.pii_types.includes('CREDIT_CARD')) {
-    recommendations.push('🔴 CRITICAL: Credit card information detected. This violates PCI-DSS standards. Remove immediately.');
-    recommendations.push('Action: Redact card number, notify payment security team.');
+  if (doc.pii_types.includes("CREDIT_CARD")) {
+    recommendations.push(
+      "🔴 CRITICAL: Credit card information detected. This violates PCI-DSS standards. Remove immediately.",
+    );
+    recommendations.push(
+      "Action: Redact card number, notify payment security team.",
+    );
   }
 
-  if (doc.pii_types.includes('EMAIL')) {
-    recommendations.push('🟡 Email addresses detected. Verify if disclosure is authorized.');
-    recommendations.push('Reference: Internal Policy COM-002 (Communication Channel Rules)');
+  if (doc.pii_types.includes("EMAIL")) {
+    recommendations.push(
+      "🟡 Email addresses detected. Verify if disclosure is authorized.",
+    );
+    recommendations.push(
+      "Reference: Internal Policy COM-002 (Communication Channel Rules)",
+    );
   }
 
-  if (doc.pii_types.includes('PHONE')) {
-    recommendations.push('🟡 Phone numbers detected. Confirm necessity and authorization for sharing.');
+  if (doc.pii_types.includes("PHONE")) {
+    recommendations.push(
+      "🟡 Phone numbers detected. Confirm necessity and authorization for sharing.",
+    );
   }
 
-  if (doc.pii_types.includes('DATE_OF_BIRTH')) {
-    recommendations.push('🟡 Date of birth detected. Combined with other PII, this increases identity theft risk.');
+  if (doc.pii_types.includes("DATE_OF_BIRTH")) {
+    recommendations.push(
+      "🟡 Date of birth detected. Combined with other PII, this increases identity theft risk.",
+    );
   }
 
   if (doc.risk_score >= 0.7) {
-    recommendations.push('⚠️ HIGH RISK: Document should be escalated to compliance team within 24 hours.');
+    recommendations.push(
+      "⚠️ HIGH RISK: Document should be escalated to compliance team within 24 hours.",
+    );
   }
 
   return recommendations;
 }
 
 // Serve frontend
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'frontend', 'index.html'));
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "frontend", "index.html"));
 });
 
 // Start server
 app.listen(PORT, async () => {
-  console.log(`\n🚀 Legal Auditor Server running on http://localhost:${PORT}\n`);
-  
+  console.log(
+    `\n🚀 Legal Auditor Server running on http://localhost:${PORT}\n`,
+  );
+
   // Test ES connection on startup
   const connected = await testConnection();
   if (!connected) {
-    console.log('⚠️  Warning: Elasticsearch connection failed. Some features may not work.\n');
+    console.log(
+      "⚠️  Warning: Elasticsearch connection failed. Some features may not work.\n",
+    );
   }
-  
-  console.log('📊 Dashboard: http://localhost:' + PORT);
-  console.log('📚 API Docs:');
-  console.log('   GET  /api/health         - Health check');
-  console.log('   GET  /api/stats          - Dashboard statistics');
-  console.log('   GET  /api/documents      - List all documents');
-  console.log('   GET  /api/documents/flagged - Flagged documents');
-  console.log('   GET  /api/policies       - List policies');
-  console.log('   POST /api/policies/search - Search policies');
-  console.log('   POST /api/analyze        - Analyze new document');
-  console.log('   GET  /api/violations     - List violations');
-  console.log('   POST /api/violations     - Create violation');
-  console.log('');
+
+  console.log("📊 Dashboard: http://localhost:" + PORT);
+  console.log("📚 API Docs:");
+  console.log("   GET  /api/health         - Health check");
+  console.log("   GET  /api/stats          - Dashboard statistics");
+  console.log("   GET  /api/documents      - List all documents");
+  console.log("   GET  /api/documents/flagged - Flagged documents");
+  console.log("   GET  /api/policies       - List policies");
+  console.log("   POST /api/policies/search - Search policies");
+  console.log("   POST /api/analyze        - Analyze new document");
+  console.log("   GET  /api/violations     - List violations");
+  console.log("   POST /api/violations     - Create violation");
+  console.log("");
 });
