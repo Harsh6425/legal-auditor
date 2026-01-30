@@ -1,0 +1,33 @@
+{
+  "name": "context-aware-legal-auditor",
+  "version": "1.0.0",
+  "description": "AI-powered compliance agent using Elasticsearch Agent Builder for PII detection and regulatory violation monitoring",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "setup": "node scripts/setup-indices.js && node scripts/setup-pipelines.js",
+    "ingest": "node scripts/ingest-policies.js && node scripts/ingest-documents.js",
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node scripts/test-connection.js"
+  },
+  "keywords": [
+    "elasticsearch",
+    "agent-builder",
+    "compliance",
+    "pii-detection",
+    "gdpr",
+    "hipaa",
+    "legal-auditor",
+    "ner",
+    "hybrid-search"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@elastic/elasticsearch": "^8.12.0",
+    "dotenv": "^16.4.1",
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
+  }
+}
